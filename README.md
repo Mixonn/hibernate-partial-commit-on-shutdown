@@ -1,128 +1,176 @@
-# emf-close-repro-spring
+# hibernate-partial-commit-on-shutdown
 
-Reprodukcja częściowego commitu przy zamykaniu aplikacji, w prawdziwej aplikacji Spring Boot
-z Kafką i z RabbitMQ, oraz test fixa. Bez żadnych zmian w Springu, Hibernate, HikariCP ani w kontenerach
-listenerów.
+Stopping an application at the wrong moment can save **half of a transaction** to the database, with no error in the
+logs. This repo shows it on a simple shop application (Spring Boot 4, Hibernate 7, Postgres) with RabbitMQ and with
+Kafka, and then shows a fix.
 
-Stos: **Spring Boot 4.1.1** (Spring 7.0.9, **Hibernate 7.4.5**, HikariCP), Postgres 16,
-`apache/kafka-native:3.8.0`, `rabbitmq:4.1-management`, Testcontainers 2. To ta sama linia, której
-używa firmowa libka w wersji na Boot 4. Wcześniej to samo przeszło na Spring Boot 3.5.16 / Hibernate 6.6 z identycznym
-wynikiem (opis na dole).
+## The story
 
-## Moduły
+The shop receives the message **"customer paid for the order"**. The handler does three things in one transaction:
 
-| Moduł | Co zawiera |
-|---|---|
-| `repro-common` | encje, transakcja handlera (`ReproWork`), punkty kontrolne testu (`Hooks`), wspólny test (`AbstractShutdownReproTest`, jako test-jar) |
-| `repro-veto` | **fix**: `EmfCloseVetoConfiguration`. Nie jest skanowany automatycznie, trzeba go dołożyć do kontekstu |
-| `repro-kafka` | aplikacja z `@KafkaListener`; `KafkaShutdownReproTest` (bez fixa) i `KafkaShutdownReproWithVetoTest` (te same scenariusze z fixem) |
-| `repro-amqp` | aplikacja z `@RabbitListener`; `AmqpShutdownReproTest` i `AmqpShutdownReproWithVetoTest` |
+1. saves the payment,
+2. changes the order status to `PAID`,
+3. calls an external fraud-check system (which is slow today).
 
-## Co robi handler
+During step 3 Kubernetes stops the pod (SIGTERM). Spring waits a while for the handler, eventually gives up and shuts
+down the rest of the application, including Hibernate. Then the fraud check answers and the handler finishes its
+transaction.
 
-Jedna transakcja `@Transactional`:
+**Without the fix** the database has the payment, but the order is still `NEW`. The application thinks everything went
+fine, the message is acknowledged, and there is no error in the logs.
 
-1. `save(new IdentityRow(msg))`: encja z `IDENTITY`, więc INSERT idzie do bazy od razu;
-2. `counter.setValue(value + 1)`: UPDATE czeka w Persistence Context na flush przy commicie;
-3. praca bez żadnej operacji ORM na końcu transakcji (jak wywołanie HTTP).
+**With the fix** nothing is saved, the application knows it failed, the message comes back, and a new pod processes it
+in full: the payment is there and the order is `PAID`.
 
-Test wysyła wiadomość, czeka, aż handler będzie w kroku 3, i zamyka kontekst
-(`ConfigurableApplicationContext.close()`, czyli to samo, co robi shutdown hook po SIGTERM).
-Potem sprawdza w bazie: **FULL** (wiersz i licznik = 1), **PARTIAL** (wiersz bez licznika),
-**NONE** (nic).
+```mermaid
+sequenceDiagram
+    participant B as Broker (RabbitMQ / Kafka)
+    participant H as Payment handler
+    participant DB as Database
+    participant S as Spring (shutting down)
 
-Jedyne, czym test steruje, to moment, w którym handler kończy krok 3.
-Wariant „z wolnym beanem” dodaje bean, który przy zamykaniu pracuje 500 ms i niszczy się między EMF
-a pulą Hikari. EMF zależy od niego tak jak od Flyway czy Liquibase. Odtwarza to większą aplikację,
-w której w tym czasie zamyka się więcej rzeczy.
+    B->>H: customer paid for order-1
+    H->>DB: INSERT payment (sent right away)
+    Note over H: status PAID only in Hibernate's memory
+    H->>H: waits for the fraud check...
+    S->>S: SIGTERM, waits for the handler (5 s / 30 s)
+    S->>S: gives up, closes Hibernate
+    H->>DB: COMMIT
+    Note over DB: without the fix: payment saved, status NEW
+    Note over DB: with the fix: ROLLBACK, the message comes back
+```
 
-## Fix
+## Why it happens
 
-`EmfCloseVetoConfiguration` rejestruje bean `TransactionExecutionListener`. Spring Boot sam podpina
-go do transaction managera, a test to sprawdza. Przy starcie każdej nowej transakcji listener rejestruje
-w transakcji Hibernate `jakarta.transaction.Synchronization`. Hibernate woła ją po flushu, a przed
-`Connection.commit()`. Jeśli fabryka sesji jest zamknięta, synchronizacja rzuca wyjątek i Hibernate robi
-rollback. Całość korzysta wyłącznie z publicznego API Springa i Hibernate.
+Hibernate keeps changes in memory, like a **scratchpad**, and writes them to the database only at the end of the
+transaction.
 
-Wyjątek, który dostaje aplikacja, to `JpaSystemException ← LocalSynchronizationException ←
-CommitRefusedException`. Odmowę trzeba więc rozpoznawać po łańcuchu przyczyn (albo po fladze), a nie
-po typie wyjątku na wierzchu.
+- The payment's id is assigned by the database, so Hibernate has to write the payment right away. That part is
+  already in the database, though not committed yet.
+- The order status change waits in the scratchpad.
 
-## Wyniki: Spring Boot 4.1.1 / Hibernate 7.4.5 (19.10.2026)
+If Hibernate has already been closed when the transaction ends, it **silently skips writing out the scratchpad**, but
+still tells the database to commit. The database commits what it received: the payment alone.
 
-| Scenariusz | Kafka bez fixa | Kafka z fixem | RabbitMQ bez fixa | RabbitMQ z fixem |
-|---|---|---|---|---|
-| kontrola: handler kończy się w 500 ms | FULL | FULL | FULL | FULL |
-| handler w transakcji, gdy EMF się zamyka, minimalna aplikacja | **PARTIAL** z wyjątkiem I/O albo NONE: wyścig o milisekundy z Hikari, zdarzało się jedno i drugie | NONE (odmowa) | **PARTIAL**, wyjątek I/O | NONE (odmowa) |
-| to samo z wolnym beanem (500 ms) | **PARTIAL, bez wyjątku** | NONE (odmowa) | **PARTIAL, bez wyjątku** | NONE (odmowa) |
+When Spring stops waiting for the handler:
 
-Spring czeka na listener **30 s przy Kafce** (`spring.lifecycle.timeout-per-shutdown-phase`) i **5 s przy
-RabbitMQ** (`shutdownTimeout`). Przy RabbitMQ wątek jest przerywany, ale handler czekający na gniazdo
-tego nie zauważa.
-
-Przegląd okna czasowego (wolny bean, handler kończy pracę w zadanym momencie od startu zamykania,
-co 100 ms):
-
-| Koniec pracy handlera | bez fixa (Kafka i RabbitMQ) | z fixem (Kafka i RabbitMQ) |
+| Broker | How long Spring waits | What happens next |
 |---|---|---|
-| przed zamknięciem EMF | FULL | FULL |
-| od zamknięcia EMF do zamknięcia puli (ok. 500 ms) | **PARTIAL, bez wyjątku** | NONE (odmowa weta) |
-| po zamknięciu puli Hikari | NONE, wyjątek „This connection has been closed” | NONE (odmowa weta) |
+| RabbitMQ | 5 s | it interrupts the thread, but waiting for an HTTP response does not notice |
+| Kafka | 30 s | it moves on; the handler's thread keeps working |
 
-Z fixem w żadnym z przebiegów nie było częściowego zapisu.
+Between closing Hibernate and closing the database connection pool there is a window in which the transaction gets
+committed halfway. In this application it is 0.5 s: the time `MetricsExporter` needs to send its remaining metrics on
+shutdown. Real applications usually have several such components.
 
-Dowód od strony Postgresa (`log_statement=all` i `xmin`, test `evidence_serverSideViewOfPartialCommit`).
+The window ends when the connection pool shuts down: HikariCP then aborts even the connections that are still in use,
+so a later commit fails with an error instead of saving half of the data.
 
-Bez fixa:
+## Hard evidence from the database
+
+Could the missing status change be caused by the isolation level, or by how the test reads the database? The two
+`databaseProof_...` tests ask Postgres itself, bypassing the application:
+
+1. **The Postgres statement log**: what actually reached the database from the handler in its transaction.
+2. **The transaction number stored in each row** (`xmin`). In every row Postgres stores the number of the transaction
+   that created the row's current version. If the handler had changed the order status, the order row would carry the
+   handler's transaction number.
+
+Without the fix:
 
 ```
-LOG:  statement: BEGIN
-LOG:  execute <unnamed>: insert into identity_row (msg) values ($1)
-LOG:  execute <unnamed>: select c1_0.id,c1_0.value from counter c1_0 where c1_0.id=$1
-LOG:  execute S_1: COMMIT
+STEP 9: Postgres log: everything it received from the handler in this transaction:
+        BEGIN
+        insert into payments (amount,order_id) values ($1,$2)   <- saves the payment
+        select o1_0.id,o1_0.status from orders o1_0 where o1_0.id=$1   <- reads the order
+        COMMIT   <- commit
+STEP 10: Postgres about the order: it was last changed by transaction no. 739, the one in which the test created the order (no. 739)
+STEP 11: Postgres about the payment: it was saved by transaction no. 740, the handler's transaction (no. 740, ended with: COMMIT)
+STEP 12: CONCLUSION: the status change never reached the database, and the database committed the rest of the handler's transaction.
 ```
 
-Z fixem:
+With the fix:
 
 ```
-LOG:  statement: BEGIN
-LOG:  execute <unnamed>: insert into identity_row (msg) values ($1)
-LOG:  execute <unnamed>: select c1_0.id,c1_0.value from counter c1_0 where c1_0.id=$1
-LOG:  execute S_1: ROLLBACK
+STEP 9: Postgres log: everything it received from the handler in this transaction:
+        BEGIN
+        insert into payments (amount,order_id) values ($1,$2)   <- saves the payment
+        select o1_0.id,o1_0.status from orders o1_0 where o1_0.id=$1   <- reads the order
+        ROLLBACK   <- rollback
+STEP 10: Postgres about the order: it was last changed by transaction no. 734, the one in which the test created the order (no. 734)
+STEP 11: Postgres about the payment: it is not in the database
+STEP 12: CONCLUSION: the database rolled back the handler's whole transaction. Nothing was saved halfway.
 ```
 
-UPDATE nigdy nie dociera do bazy, bo Hibernate pomija flush (`Skipping auto-flush due to session closed`).
-Bez fixa `xmin` licznika zostaje taki jak przy wstawieniu na starcie testu, a nowy wiersz ma `xmin`
-transakcji handlera, więc zatwierdzona została połowa transakcji. Izolacja nie ma tu znaczenia.
-Z fixem nowego wiersza nie ma.
+The statement that changes the status (`update orders`) never reached the database at all. Hibernate did not send it,
+because it had already been closed, and yet it sent `COMMIT`.
 
-## Co z tego wynika
+## The fix
 
-- Częściowy commit pojawia się wtedy, gdy handler jest w transakcji dłużej, niż Spring czeka na listenery,
-  i kończy ją w oknie między zamknięciem EMF a zamknięciem puli połączeń.
-- W minimalnej aplikacji okno ma pojedyncze milisekundy i zwykle kończy się wyjątkiem. Każda dodatkowa
-  praca przy zamykaniu między EMF a pulą poszerza je, a wtedy częściowy commit przechodzi **bez żadnego
-  wyjątku i bez logu powyżej TRACE**.
-- Przy Kafce i domyślnym `terminationGracePeriodSeconds: 30` w Kubernetesie SIGKILL przychodzi mniej
-  więcej wtedy, gdy kończy się 30-sekundowa faza. Przy dłuższym grace period ścieżka jest w pełni osiągalna.
-- Fix zamienia każdy taki przypadek na rollback z rozpoznawalnym wyjątkiem i nie zmienia wyniku, gdy
-  handler zdąży przed zamknięciem EMF.
+[`PartialCommitGuard`](partial-commit-guard/src/main/java/fix/PartialCommitGuard.java) is a single configuration you add
+to the application. At the start of every transaction it leaves a "guard" in it. Hibernate asks the guard right before
+committing, after it has written out the scratchpad. If Hibernate is closed at that point, the guard refuses and
+Hibernate rolls the whole transaction back. **Either everything is saved, or nothing.** In normal operation the guard
+changes nothing.
 
-## Spring Boot 3.5.16 / Hibernate 6.6 (pierwsza wersja repo)
+## Where to find what
 
-Te same scenariusze bez fixa dały identyczne wyniki: PARTIAL z wyjątkiem I/O w minimalnej aplikacji,
-PARTIAL bez wyjątku z wolnym beanem, to samo okno czasowe i ten sam log serwera. Repo zostało potem
-przeniesione na Boot 4, więc tamte wyniki są tylko tutaj.
+| File | What it is |
+|---|---|
+| [`PaymentReceivedHandler`](shop-common/src/main/java/shop/payment/PaymentReceivedHandler.java) | the payment handler: ordinary, everyday code |
+| [`PaymentShutdownStory`](shop-common/src/test/java/shop/PaymentShutdownStory.java) | **the test stories, without and with the fix** (start here), plus the two database-proof tests |
+| [`FraudCheckClient`](shop-common/src/main/java/shop/payment/FraudCheckClient.java) | a fake fraud-check system; the test decides when it answers |
+| [`MetricsExporter`](shop-common/src/main/java/shop/infra/MetricsExporter.java) | a component that takes 0.5 s to shut down |
+| [`PartialCommitGuard`](partial-commit-guard/src/main/java/fix/PartialCommitGuard.java) | the fix |
+| `shop-rabbitmq`, `shop-kafka` | the listener for each broker and a test that runs the same stories |
 
-## Uruchomienie
+## Running it
 
-Wymaga Dockera (np. OrbStack) i Javy 21+.
+Requires Docker (e.g. OrbStack) and Java 21+. In the IDE just run `RabbitMqPaymentShutdownTest` or
+`KafkaPaymentShutdownTest`. From the terminal:
 
 ```bash
 mvn -B install -DskipTests
-mvn -B -pl repro-kafka test -Dtest='*ShutdownRepro*Test#control_*+minimalApp_*+appWithSlowShutdownBean_*+evidence_*'
-mvn -B -pl repro-amqp test -Dtest='*ShutdownRepro*Test#control_*+minimalApp_*+appWithSlowShutdownBean_*+evidence_*'
-mvn -B -pl repro-kafka test -Dtest='*ShutdownRepro*Test#sweep_*'   # ok. 13 min, oba warianty
 ```
 
-Linie `RESULT`, `SWEEP` i `EVIDENCE` są w `repro-*/target/surefire-reports/*-output.txt`.
+```bash
+mvn -B -pl shop-rabbitmq test
+```
+
+```bash
+mvn -B -pl shop-kafka test
+```
+
+The console tells the story step by step (RabbitMQ, without the fix):
+
+```
+STEP 1: Starting the shop application WITHOUT THE FIX
+STEP 2: The database has order order-914edd11: payments: 0, order status: NEW
+STEP 3: The customer pays: sending the payment message for order-914edd11 (the fraud check is slow today)
+[handler] saved the payment for order-914edd11 (the INSERT already went to the database, not committed yet)
+[handler] marked order order-914edd11 as PAID (for now only in Hibernate's memory)
+[handler] calling the fraud check...
+STEP 4: Kubernetes stops the pod (SIGTERM) while the handler is in the middle of its transaction
+STEP 5: Spring waits for the handler: with RabbitMQ 5 s (shutdownTimeout); then it interrupts the thread, but waiting for an HTTP response does not notice
+Closing JPA EntityManagerFactory for persistence unit 'default'
+[metrics] sending the remaining metrics before shutdown (0.5 s)
+STEP 6: Spring stopped waiting and closed Hibernate. The handler is still waiting for the fraud check
+STEP 7: The fraud check finally answers, the handler finishes its transaction
+[handler] the fraud check answered, finishing the transaction (commit)
+STEP 8: The application has stopped
+STEP 9: According to the application, processing succeeded: success
+STEP 10: In the database: payments: 1, order status: NEW
+STEP 11: RESULT: payment saved, order unpaid. The data is inconsistent and there is no error in the logs.
+```
+
+## What the test simplifies
+
+- The only thing the test controls is when the fraud check answers: right after Spring closes Hibernate. In real life,
+  hitting that window is a matter of chance.
+- Spring, Hibernate, the connection pool and the listener containers run without any changes.
+
+## For the curious
+
+The first commit in this repo's history (`f6a43bf`, in Polish) contains the technical version:
+- a sweep of the time window in 100 ms steps (when the result is full, partial, or rolled back);
+- a description of the same results on Spring Boot 3.5 / Hibernate 6.6.

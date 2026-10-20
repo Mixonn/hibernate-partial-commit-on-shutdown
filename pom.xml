@@ -11,16 +11,16 @@
         <relativePath/>
     </parent>
 
-    <groupId>repro</groupId>
-    <artifactId>emf-close-repro-spring</artifactId>
+    <groupId>shop</groupId>
+    <artifactId>hibernate-partial-commit-on-shutdown</artifactId>
     <version>0.1.0</version>
     <packaging>pom</packaging>
 
     <modules>
-        <module>repro-common</module>
-        <module>repro-veto</module>
-        <module>repro-kafka</module>
-        <module>repro-amqp</module>
+        <module>shop-common</module>
+        <module>partial-commit-guard</module>
+        <module>shop-rabbitmq</module>
+        <module>shop-kafka</module>
     </modules>
 
     <properties>
@@ -30,19 +30,19 @@
     <dependencyManagement>
         <dependencies>
             <dependency>
-                <groupId>repro</groupId>
-                <artifactId>repro-common</artifactId>
+                <groupId>shop</groupId>
+                <artifactId>shop-common</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
-                <groupId>repro</groupId>
-                <artifactId>repro-common</artifactId>
+                <groupId>shop</groupId>
+                <artifactId>shop-common</artifactId>
                 <version>${project.version}</version>
                 <type>test-jar</type>
             </dependency>
             <dependency>
-                <groupId>repro</groupId>
-                <artifactId>repro-veto</artifactId>
+                <groupId>shop</groupId>
+                <artifactId>partial-commit-guard</artifactId>
                 <version>${project.version}</version>
             </dependency>
         </dependencies>
@@ -54,7 +54,6 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <redirectTestOutputToFile>true</redirectTestOutputToFile>
                     <trimStackTrace>false</trimStackTrace>
                 </configuration>
             </plugin>
