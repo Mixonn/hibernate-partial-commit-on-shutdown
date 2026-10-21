@@ -1,7 +1,7 @@
 package plainhibernate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import jakarta.persistence.Entity;
@@ -22,6 +22,8 @@ import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
 import org.hibernate.cfg.AvailableSettings;
 import org.hibernate.cfg.Configuration;
+import org.hibernate.resource.transaction.LocalSynchronizationException;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
@@ -29,7 +31,8 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
  * Plain Hibernate, no Spring: the SessionFactory is closed while another thread has an open transaction, and that
- * thread's commit() then saves only part of the transaction, without an exception.
+ * thread's commit() then saves only part of the transaction, without an exception. The same happens when close() and
+ * commit() run on one thread; without close() both changes are committed.
  */
 class SessionFactoryClosedBeforeCommitTest {
 
@@ -76,6 +79,45 @@ class SessionFactoryClosedBeforeCommitTest {
         sql("insert into orders (id, status) values (1, 'NEW')");
     }
 
+    @AfterEach
+    void tearDown() {
+        if (!sessionFactory.isClosed()) {
+            sessionFactory.close();
+        }
+    }
+
+    @Test
+    void withoutCloseBothChangesAreCommitted() throws Exception {
+        try (Session session = sessionFactory.openSession()) {
+            Transaction transaction = session.beginTransaction();
+            Payment payment = new Payment();
+            payment.orderId = 1L;
+            session.persist(payment);
+            session.find(Order.class, 1L).status = "PAID";
+            transaction.commit();
+        }
+
+        assertEquals(1, count("select count(*) from payments where orderId = 1"));
+        assertEquals("PAID", status());
+    }
+
+    @Test
+    void closeAndCommitOnTheSameThreadAlsoSaveOnlyPartOfTheTransaction() throws Exception {
+        Session session = sessionFactory.openSession();
+        Transaction transaction = session.beginTransaction();
+        Payment payment = new Payment();
+        payment.orderId = 1L;
+        session.persist(payment);
+        session.find(Order.class, 1L).status = "PAID";
+
+        sessionFactory.close();
+        transaction.commit();
+        session.close();
+
+        assertEquals(1, count("select count(*) from payments where orderId = 1"), "the INSERT was committed");
+        assertEquals("NEW", status(), "the UPDATE was never executed, yet the transaction was committed");
+    }
+
     @Test
     void commitAfterSessionFactoryCloseSavesOnlyPartOfTheTransaction() throws Exception {
         Throwable commitFailure = commitAfterSessionFactoryIsClosed(null);
@@ -103,7 +145,8 @@ class SessionFactoryClosedBeforeCommitTest {
 
         Throwable commitFailure = commitAfterSessionFactoryIsClosed(guard);
 
-        assertNotNull(commitFailure, "commit() failed");
+        assertInstanceOf(LocalSynchronizationException.class, commitFailure, "commit() failed because of the guard");
+        assertEquals("SessionFactory was closed before commit: rolling back", commitFailure.getCause().getMessage());
         assertEquals(0, count("select count(*) from payments where orderId = 1"), "the INSERT was rolled back");
         assertEquals("NEW", status());
     }
