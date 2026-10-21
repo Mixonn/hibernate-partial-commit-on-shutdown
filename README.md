@@ -1,4 +1,4 @@
-# wtf-hibernate
+# hibernate-partial-commit-on-shutdown
 
 Stopping an application at the wrong moment can save **half of a transaction** to the database, with no error in the
 logs. This repo shows it on a simple shop application (Spring Boot 4, Hibernate 7, Postgres): on RabbitMQ and Kafka
