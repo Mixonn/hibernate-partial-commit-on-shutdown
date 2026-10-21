@@ -10,7 +10,11 @@ import jakarta.persistence.Table;
 @Table(name = "payments")
 public class Payment {
 
-    /** The database assigns the id (IDENTITY), so Hibernate has to send the INSERT right away to learn it. */
+    /**
+     * The database generates the id (IDENTITY). Hibernate cannot keep this INSERT in memory until the end of the
+     * transaction, like other changes: it sends it right away, on save(), to learn the id. That is why the payment
+     * reaches the database even when the rest of the transaction does not.
+     */
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
