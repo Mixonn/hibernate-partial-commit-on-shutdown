@@ -1,12 +1,7 @@
 package shop;
 
-import static org.assertj.core.api.Assertions.assertThat;
-
 import fix.PartialCommitGuard;
 import jakarta.persistence.EntityManagerFactory;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,6 +10,12 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import shop.PostgresLog.PaymentTransaction;
 import shop.TransactionOutcomes.Outcome;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The story: a customer pays for an order, and while that payment is being recorded, Kubernetes stops the pod.
@@ -28,7 +29,9 @@ import shop.TransactionOutcomes.Outcome;
  */
 abstract class PaymentShutdownStory {
 
-    /** Postgres writes every statement that actually reached it to its own log, together with the transaction number. */
+    /**
+     * Postgres writes every statement that actually reached it to its own log, together with the transaction number.
+     */
     private static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:16-alpine")
             .withCommand("postgres", "-c", "fsync=off", "-c", "log_statement=all", "-c", "log_line_prefix=%m [%p] xid=%x ");
 
@@ -44,13 +47,19 @@ abstract class PaymentShutdownStory {
     private long orderCreatedInTransaction;
     private int step;
 
-    /** The arguments that connect a pod to the broker: its profile and its address. */
+    /**
+     * The arguments that connect a pod to the broker: its profile and its address.
+     */
     abstract List<String> brokerArguments();
 
-    /** Sends the "customer paid for the order" message to the given topic or queue. */
+    /**
+     * Sends the "customer paid for the order" message to the given topic or queue.
+     */
     abstract void sendPaymentReceived(ConfigurableApplicationContext pod, String payments, String orderId) throws Exception;
 
-    /** How long Spring waits for the payment service before it gives up and shuts down the rest of the application. */
+    /**
+     * How long Spring waits for the payment service before it gives up and shuts down the rest of the application.
+     */
     abstract String howLongSpringWaitsForThePaymentService();
 
     @Test
@@ -115,7 +124,9 @@ abstract class PaymentShutdownStory {
         step("CONCLUSION: the status change never reached the database, and the database committed the rest of the transaction.");
     }
 
-    /** Hard evidence with the fix: the database received ROLLBACK instead of COMMIT, and nothing from the transaction remains. */
+    /**
+     * Hard evidence with the fix: the database received ROLLBACK instead of COMMIT, and nothing from the transaction remains.
+     */
     @Test
     void databaseProof_withFix_theDatabaseRolledBackTheWholeTransaction() throws Exception {
         ConfigurableApplicationContext pod = startPod(true);
@@ -125,7 +136,8 @@ abstract class PaymentShutdownStory {
         step("Postgres log: everything it received from the payment service in this transaction:" + transaction.describe());
         step("Postgres about the order: it was last changed by transaction no. " + database.orderLastChangedByTransaction(orderId)
                 + ", the one in which the test created the order (no. " + orderCreatedInTransaction + ")");
-        step("Postgres about the payment: " + (database.paymentSavedByTransaction(orderId) < 0 ? "it is not in the database" : "it is there!"));
+        step("Postgres about the payment: " + (database.paymentSavedByTransaction(orderId) < 0 ? "it is not in the database" : "it is " +
+                "there!"));
 
         assertThat(transaction.ending()).isEqualTo("ROLLBACK");
         assertThat(database.orderLastChangedByTransaction(orderId)).isEqualTo(orderCreatedInTransaction);
@@ -133,7 +145,9 @@ abstract class PaymentShutdownStory {
         step("CONCLUSION: the database rolled back the whole transaction. Nothing was saved halfway.");
     }
 
-    /** The common start of every story: a payment arrives, and the pod is stopped while it is being recorded. */
+    /**
+     * The common start of every story: a payment arrives, and the pod is stopped while it is being recorded.
+     */
     private Outcome paymentArrivesAndPodIsStoppedInTheMiddle(ConfigurableApplicationContext pod) throws Exception {
         SlowFraudCheck fraudCheck = pod.getBean(SlowFraudCheck.class);
         TransactionOutcomes outcomes = pod.getBean(TransactionOutcomes.class);
@@ -163,10 +177,13 @@ abstract class PaymentShutdownStory {
         return outcome;
     }
 
-    /** Starts a pod: the shop application as it is, configured through its arguments like a production pod. */
+    /**
+     * Starts a pod: the shop application as it is, configured through its arguments like a production pod.
+     */
     private ConfigurableApplicationContext startPod(boolean withFix) {
         step(withFix ? "Starting a shop pod WITH THE FIX" : "Starting a shop pod WITHOUT THE FIX");
         List<String> args = new ArrayList<>(brokerArguments());
+        args.add("--server.port=0");
         args.add("--spring.datasource.url=" + POSTGRES.getJdbcUrl());
         args.add("--spring.datasource.username=" + POSTGRES.getUsername());
         args.add("--spring.datasource.password=" + POSTGRES.getPassword());

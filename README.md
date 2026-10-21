@@ -1,8 +1,8 @@
 # hibernate-partial-commit-on-shutdown
 
 Stopping an application at the wrong moment can save **half of a transaction** to the database, with no error in the
-logs. This repo shows it on a simple shop application (Spring Boot 4, Hibernate 7, Postgres) with RabbitMQ and with
-Kafka, and then shows a fix.
+logs. This repo shows it on a simple shop application (Spring Boot 4, Hibernate 7, Postgres): on RabbitMQ and Kafka
+messages, on an HTTP request, on a `@Scheduled` job and on an `@Async` task. Then it shows a fix.
 
 ## The story
 
@@ -29,14 +29,13 @@ sequenceDiagram
     participant P as Payment service
     participant DB as Database
     participant S as Spring (shutting down)
-
-    B->>P: customer paid for order-1
-    P->>DB: INSERT payment (sent right away)
+    B ->> P: customer paid for order-1
+    P ->> DB: INSERT payment (sent right away)
     Note over P: status PAID only in Hibernate's memory
-    P->>P: waits for the fraud check...
-    S->>S: SIGTERM, waits for the payment service (5 s / 30 s)
-    S->>S: gives up, closes Hibernate
-    P->>DB: COMMIT
+    P ->> P: waits for the fraud check...
+    S ->> S: SIGTERM, waits for the payment service (5 s / 30 s)
+    S ->> S: gives up, closes Hibernate
+    P ->> DB: COMMIT
     Note over DB: without the fix: payment saved, status NEW
     Note over DB: with the fix: ROLLBACK, the message comes back
 ```
@@ -55,10 +54,10 @@ still tells the database to commit. The database commits what it received: the p
 
 When Spring stops waiting for the payment service:
 
-| Broker | How long Spring waits | What happens next |
-|---|---|---|
-| RabbitMQ | 5 s | it interrupts the thread, but waiting for an HTTP response does not notice |
-| Kafka | 30 s | it moves on; the payment service's thread keeps working |
+| Broker   | How long Spring waits | What happens next                                                          |
+|----------|-----------------------|----------------------------------------------------------------------------|
+| RabbitMQ | 5 s                   | it interrupts the thread, but waiting for an HTTP response does not notice |
+| Kafka    | 30 s                  | it moves on; the payment service's thread keeps working                    |
 
 Between closing Hibernate and closing the database connection pool there is a window in which the transaction gets
 committed halfway. In this application it is 0.5 s: the time `MetricsExporter` needs to send its remaining metrics on
@@ -66,6 +65,30 @@ shutdown. Real applications usually have several such components.
 
 The window ends when the connection pool shuts down: HikariCP then aborts even the connections that are still in use,
 so a later commit fails with an error instead of saving half of the data.
+
+## Not only message listeners
+
+The same thing happens to any thread that is still working when Spring gives up waiting for it. The shop has three
+more ways in which a payment gets recorded, all through the same `PaymentService`, and
+[`EntryPointShutdownStory`](src/test/java/shop/EntryPointShutdownStory.java) runs the same story on each of them:
+
+| Entry point      | In the shop                                                                                       | How long Spring waits                     | What the sender saw                            |
+|------------------|---------------------------------------------------------------------------------------------------|-------------------------------------------|------------------------------------------------|
+| HTTP request     | an employee records a payment in the admin panel                                                  | 30 s: graceful shutdown of the web server | no answer: the connection was closed           |
+| `@Async` task    | the payment provider's webhook answers `202` right away and records the payment in the background | 30 s: `applicationTaskExecutor`           | `202 Accepted`: the notification was delivered |
+| `@Scheduled` job | every minute the shop asks the bank for new transfers and records each payment                    | 30 s: `taskScheduler`                     | nothing: the bank only listed the transfer     |
+
+Without the fix, all three end the way the broker stories do: the payment is saved, the order is still `NEW`, the
+application thinks the transaction was committed, and there is no error in the logs. The only trace is in the HTTP
+case: a Tomcat warning that "some application threads may still be running".
+
+What the sender saw makes it worse:
+
+- **HTTP**: the shop saved half of the payment, yet the employee's browser shows an error, which invites them to try
+  again.
+- **`@Async`**: with the fix nothing is saved halfway, but nothing is saved at all either, and the payment provider
+  already got `202`, so it will not send the notification again. The fix keeps the data consistent; it cannot bring
+  back work that existed only in the pod's memory.
 
 ## Hard evidence from the database
 
@@ -129,29 +152,35 @@ The test starts Postgres and the broker in Docker (Testcontainers), and then sta
 --spring.datasource.url=jdbc:postgresql://localhost:55002/test
 ```
 
-To each pod the test adds only two things of its own: a stand-in for the external fraud-check system (so it can decide
-when the fraud check answers) and a recorder of how transactions ended. A test with the fix also adds
-`PartialCommitGuard`.
+To each pod the test adds only its stand-ins for the external systems (the fraud check and the bank, so it can decide
+when they answer) and a recorder of how transactions ended. A test with the fix also adds `PartialCommitGuard`. The
+pods without a broker profile get only the database address, and every pod runs its web server on a free port
+(`--server.port=0`).
 
 The story needs to stop one pod in the middle of a transaction and then start a new one, so the test starts the pods
 itself instead of letting `@SpringBootTest` start one application for it.
 
 ## Where to find what
 
-| File | What it is |
-|---|---|
-| [`PaymentService`](src/main/java/shop/payment/PaymentService.java) | records the payment: ordinary, everyday code |
-| [`KafkaPaymentListener`](src/main/java/shop/messaging/KafkaPaymentListener.java), [`RabbitMqPaymentListener`](src/main/java/shop/messaging/RabbitMqPaymentListener.java) | receive the payment message; each one is active only in its broker's profile |
-| [`MetricsExporter`](src/main/java/shop/infra/MetricsExporter.java) | a component that takes 0.5 s to shut down |
-| [`PartialCommitGuard`](src/main/java/fix/PartialCommitGuard.java) | the fix |
-| [`PaymentShutdownStory`](src/test/java/shop/PaymentShutdownStory.java) | **the test stories, without and with the fix** (start here), plus the two database-proof tests |
-| [`KafkaPaymentShutdownTest`](src/test/java/shop/KafkaPaymentShutdownTest.java), [`RabbitMqPaymentShutdownTest`](src/test/java/shop/RabbitMqPaymentShutdownTest.java) | the same stories on each broker: which broker to start and how to send the message |
-| [`SlowFraudCheck`](src/test/java/shop/SlowFraudCheck.java) | the test's stand-in for the fraud-check system; the test decides when it answers |
+| File                                                                                                                                                                                                                                   | What it is                                                                                      |
+|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| [`PaymentService`](src/main/java/shop/payment/PaymentService.java)                                                                                                                                                                     | records the payment: ordinary, everyday code                                                    |
+| [`KafkaPaymentListener`](src/main/java/shop/messaging/KafkaPaymentListener.java), [`RabbitMqPaymentListener`](src/main/java/shop/messaging/RabbitMqPaymentListener.java)                                                               | receive the payment message; each one is active only in its broker's profile                    |
+| [`AdminPaymentController`](src/main/java/shop/web/AdminPaymentController.java)                                                                                                                                                         | the admin panel: an HTTP request that records a payment                                         |
+| [`PaymentProviderWebhook`](src/main/java/shop/web/PaymentProviderWebhook.java), [`BackgroundPayments`](src/main/java/shop/payment/BackgroundPayments.java)                                                                             | the payment provider's webhook, which records the payment in an `@Async` task                   |
+| [`BankTransferImport`](src/main/java/shop/bank/BankTransferImport.java)                                                                                                                                                                | the `@Scheduled` job that imports bank transfers                                                |
+| [`MetricsExporter`](src/main/java/shop/infra/MetricsExporter.java)                                                                                                                                                                     | a component that takes 0.5 s to shut down                                                       |
+| [`PartialCommitGuard`](src/main/java/fix/PartialCommitGuard.java)                                                                                                                                                                      | the fix                                                                                         |
+| [`PaymentShutdownStory`](src/test/java/shop/PaymentShutdownStory.java)                                                                                                                                                                 | **the test stories, without and with the fix** (start here), plus the two database-proof tests  |
+| [`KafkaPaymentShutdownTest`](src/test/java/shop/KafkaPaymentShutdownTest.java), [`RabbitMqPaymentShutdownTest`](src/test/java/shop/RabbitMqPaymentShutdownTest.java)                                                                   | the same stories on each broker: which broker to start and how to send the message              |
+| [`EntryPointShutdownStory`](src/test/java/shop/EntryPointShutdownStory.java)                                                                                                                                                           | the same story without a broker, without and with the fix                                       |
+| [`HttpRequestShutdownTest`](src/test/java/shop/HttpRequestShutdownTest.java), [`AsyncTaskShutdownTest`](src/test/java/shop/AsyncTaskShutdownTest.java), [`ScheduledJobShutdownTest`](src/test/java/shop/ScheduledJobShutdownTest.java) | the story on each of those entry points: how the payment arrives and what the sender saw        |
+| [`SlowFraudCheck`](src/test/java/shop/SlowFraudCheck.java), [`FakeBank`](src/test/java/shop/FakeBank.java)                                                                                                                             | the test's stand-ins for the fraud-check system and the bank; the test decides when they answer |
 
 ## Running it
 
-Requires Docker (e.g. OrbStack) and Java 21+. In the IDE just run `RabbitMqPaymentShutdownTest` or
-`KafkaPaymentShutdownTest`. From the terminal:
+Requires Docker (e.g. OrbStack) and Java 21+. In the IDE just run any of the `...ShutdownTest` classes. From the
+terminal:
 
 ```bash
 mvn -B test -Dtest=RabbitMqPaymentShutdownTest
@@ -160,6 +189,12 @@ mvn -B test -Dtest=RabbitMqPaymentShutdownTest
 ```bash
 mvn -B test -Dtest=KafkaPaymentShutdownTest
 ```
+
+```bash
+mvn -B test -Dtest='HttpRequestShutdownTest,AsyncTaskShutdownTest,ScheduledJobShutdownTest'
+```
+
+Most cases take about 30 s each, because that is how long Spring waits before it gives up.
 
 The console tells the story step by step (RabbitMQ, without the fix):
 
@@ -194,5 +229,6 @@ STEP 11: RESULT: payment saved, order unpaid. The data is inconsistent and there
 ## For the curious
 
 The first commit in this repo's history (`f6a43bf`, in Polish) contains the technical version:
+
 - a sweep of the time window in 100 ms steps (when the result is full, partial, or rolled back);
 - a description of the same results on Spring Boot 3.5 / Hibernate 6.6.
