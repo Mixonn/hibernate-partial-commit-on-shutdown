@@ -15,6 +15,18 @@ Every scenario is ordinary Spring code, tested against real Postgres, Kafka and 
 | [@Scheduled] A `@Scheduled` job calls the same service for each new bank transfer. The pod is stopped while the job runs.                                                                             | [`ScheduledJobShutdownTest`](src/test/java/shop/ScheduledJobShutdownTest.java)              | ❌ Payment saved but the order is still `NEW`, with no error in the logs.                             | ✅ Rolled back and nothing saved.                                                     |
 | [Proof from Postgres] The Kafka and RabbitMQ scenarios, checked in Postgres itself (statement log and `xmin`) instead of through the application.                                                     | `databaseProof_…` in [`PaymentShutdownStory`](src/test/java/shop/PaymentShutdownStory.java) | ❌ Postgres received the payment `INSERT` and a `COMMIT`, but never the order `UPDATE`.               | ✅ Postgres received `ROLLBACK` instead of `COMMIT`, and the payment isn't there.     |
 
+## How long the window is
+
+The half-saved transaction happens when the commit lands between closing Hibernate and closing the connection pool.
+In this shop [`MetricsExporter`](src/main/java/shop/infra/MetricsExporter.java) widens that window on purpose:
+
+| Shop                                                                  | Window       | Saved halfway, no error | Saved halfway, the app gets an error |
+|-----------------------------------------------------------------------|--------------|-------------------------|--------------------------------------|
+| with `MetricsExporter` (the demo)                                     | about 0.5 s  | the whole window        | only at its very end                 |
+| without it: plain Spring Boot + Hibernate + HikariCP, nothing between | about 1.2 ms | the first ~0.5 ms       | the rest (`Socket closed`)           |
+
+How it was measured, the sweep and what it means for real applications: [`docs/window-measurement.md`](docs/window-measurement.md).
+
 ## The story
 
 The shop receives the message **"customer paid for the order"**. The payment service does three things in one
