@@ -232,3 +232,6 @@ The first commit in this repo's history (`f6a43bf`, in Polish) contains the tech
 
 - a sweep of the time window in 100 ms steps (when the result is full, partial, or rolled back);
 - a description of the same results on Spring Boot 3.5 / Hibernate 6.6.
+
+[`docs/window-measurement.md`](docs/window-measurement.md) measures how wide the window is without `MetricsExporter`,
+with the code that measured it in [`src/test/java/shop/window`](src/test/java/shop/window).
