@@ -14,42 +14,58 @@
     <groupId>shop</groupId>
     <artifactId>wtf-hibernate</artifactId>
     <version>0.1.0</version>
-    <packaging>pom</packaging>
-
-    <modules>
-        <module>shop-common</module>
-        <module>partial-commit-guard</module>
-        <module>shop-rabbitmq</module>
-        <module>shop-kafka</module>
-    </modules>
 
     <properties>
         <java.version>21</java.version>
     </properties>
 
-    <dependencyManagement>
-        <dependencies>
-            <dependency>
-                <groupId>shop</groupId>
-                <artifactId>shop-common</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>shop</groupId>
-                <artifactId>shop-common</artifactId>
-                <version>${project.version}</version>
-                <type>test-jar</type>
-            </dependency>
-            <dependency>
-                <groupId>shop</groupId>
-                <artifactId>partial-commit-guard</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-        </dependencies>
-    </dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-kafka</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-rabbitmq</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
