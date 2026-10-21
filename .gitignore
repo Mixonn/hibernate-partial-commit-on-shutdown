@@ -2,3 +2,6 @@ target/
 *.log
 .idea/
 *.iml
+
+# Local drafts, not published
+docs/hibernate-issue-draft.md
