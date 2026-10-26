@@ -5,15 +5,14 @@ import org.hibernate.FlushMode;
 import org.hibernate.Session;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
 import org.springframework.orm.jpa.EntityManagerHolder;
+import org.springframework.stereotype.Component;
 import org.springframework.transaction.TransactionExecution;
 import org.springframework.transaction.TransactionExecutionListener;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
- * The fix. Adding this configuration to the application is all it takes.
+ * The fix. Adding this component to the application is all it takes.
  * <p>
  * The problem: when Spring has closed Hibernate while a transaction is still running, Hibernate silently skips
  * writing the in-memory changes at commit, but still tells the database to commit. Only part of the data ends up
@@ -22,36 +21,31 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * The fix: at the start of every transaction we leave a "guard" in it. Hibernate asks the guard right before
  * committing, after it has written out the changes. If Hibernate is closed at that point, the guard refuses and
  * Hibernate rolls the whole transaction back. Either everything is saved, or nothing.
+ * <p>
+ * Spring Boot attaches this listener to the transaction manager on its own. It lives outside the {@code shop}
+ * package on purpose: component scanning does not find it, so the tests can run the shop both without and with it.
  */
-@Configuration(proxyBeanMethods = false)
-public class PartialCommitGuard {
+@Component
+public class PartialCommitGuard implements TransactionExecutionListener {
 
-    @Bean
-    GuardInstaller partialCommitGuardInstaller() {
-        return new GuardInstaller();
-    }
+    private static final Logger log = LoggerFactory.getLogger(PartialCommitGuard.class);
 
-    /** Spring Boot attaches this listener to the transaction manager on its own; it is called at the start of every transaction. */
-    static final class GuardInstaller implements TransactionExecutionListener {
-
-        private static final Logger log = LoggerFactory.getLogger(GuardInstaller.class);
-
-        @Override
-        public void afterBegin(TransactionExecution transaction, Throwable beginFailure) {
-            if (beginFailure != null || !transaction.isNewTransaction()) {
-                return;
-            }
-            try {
-                for (Object resource : TransactionSynchronizationManager.getResourceMap().values()) {
-                    if (resource instanceof EntityManagerHolder holder) {
-                        Session session = holder.getEntityManager().unwrap(Session.class);
-                        session.getTransaction().registerSynchronization(new Guard(session));
-                    }
+    /** Called at the start of every transaction. */
+    @Override
+    public void afterBegin(TransactionExecution transaction, Throwable beginFailure) {
+        if (beginFailure != null || !transaction.isNewTransaction()) {
+            return;
+        }
+        try {
+            for (Object resource : TransactionSynchronizationManager.getResourceMap().values()) {
+                if (resource instanceof EntityManagerHolder holder) {
+                    Session session = holder.getEntityManager().unwrap(Session.class);
+                    session.getTransaction().registerSynchronization(new Guard(session));
                 }
-            } catch (RuntimeException e) {
-                // Never throw from here: it would break the start of the transaction.
-                log.warn("Could not add the guard to the transaction", e);
             }
+        } catch (RuntimeException e) {
+            // Never throw from here: it would break the start of the transaction.
+            log.warn("Could not add the guard to the transaction", e);
         }
     }
 
