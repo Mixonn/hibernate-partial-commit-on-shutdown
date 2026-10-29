@@ -154,7 +154,7 @@ because it had already been closed, and yet it sent `COMMIT`.
 
 ## The fix
 
-[`PartialCommitGuard`](src/main/java/fix/PartialCommitGuard.java) is a single configuration you add to the
+[`PartialCommitGuard`](src/main/java/fix/PartialCommitGuard.java) is a single component you add to the
 application. At the start of every transaction it leaves a "guard" in it. Hibernate asks the guard right before
 committing, after it has written out the scratchpad. If Hibernate is closed at that point, the guard refuses and
 Hibernate rolls the whole transaction back. **Either everything is saved, or nothing.** In normal operation the guard
